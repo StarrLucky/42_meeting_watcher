@@ -3,3 +3,7 @@ state/
 .env
 __pycache__/
 *.pyc
+
+# captured traffic — contains secrets
+*.har
+cookies.json
