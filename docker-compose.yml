@@ -1,0 +1,12 @@
+services:
+  watcher:
+    build: .
+    image: 42-meeting-watcher
+    container_name: 42-meeting-watcher
+    restart: unless-stopped
+    env_file: .env
+    # Persist the login session + BOOKED sentinel + debug dumps across restarts.
+    volumes:
+      - ./state:/app/state
+    # Optional: run a one-off check instead of the loop:
+    #   docker compose run --rm watcher python watcher.py check
