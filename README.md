@@ -65,17 +65,35 @@ docker compose run --rm watcher python watcher.py book-test
 Without Docker, the same commands work directly:
 `pip install -r requirements.txt` then `python watcher.py check`.
 
-## The `Next-Action` ids can go stale
+## `Next-Action` ids: auto-discovered (self-healing)
 
-Booking and cancelling are Next.js **Server Actions**, identified by a hashed id
-(`Next-Action` header). These are stable per site deployment but **change when 42
-rebuilds the app**. Defaults are baked into `.env.example`; if booking starts
-failing with HTTP errors, re-capture them:
+Booking is a Next.js **Server Action**, identified by a hashed id (`Next-Action`
+header). That id rotates whenever 42 rebuilds the app — but the underlying source
+function **name** (`registerToMeeting`) is stable. So the watcher **auto-discovers
+the current id at booking time**: it fetches the `/paths` route JS chunk
+(`app/[locale]/(authenticated)/paths/page-<hash>.js`) and reads
 
-1. Log in at apply.42.tech, open DevTools → **Network**.
-2. Click a meeting slot (open the confirm dialog / confirm).
-3. Find the `POST` to `/en/paths` → copy the **`Next-Action`** request header.
-4. Put it in `.env` as `BOOK_ACTION_ID` (and `CANCEL_ACTION_ID` for the cancel action).
+```js
+createServerReference("40d112…", callServer, void 0, findSourceMapURL, "registerToMeeting")
+```
+
+mapping the stable name → the current id. No manual maintenance on redeploys.
+
+Inspect what it resolves right now:
+
+```bash
+docker compose run --rm watcher python watcher.py discover
+```
+
+Controls (in `.env`, all optional):
+- `AUTO_DISCOVER_ACTIONS=1` — set `0` to disable and always use the fallback id.
+- `BOOK_ACTION_NAME=registerToMeeting` / `CANCEL_ACTION_NAME=delistMeeting` — the
+  stable names to look up (only change if 42 renames the action functions).
+- `BOOK_ACTION_ID` / `CANCEL_ACTION_ID` — fallback ids used only if discovery fails.
+
+The watcher also fingerprints the site build each run; if it changes (a redeploy)
+it just logs that ids will be re-discovered. If a booking ever fails outright you
+still get a loud Telegram alert to book manually.
 
 ## Telegram alerts (optional, recommended)
 

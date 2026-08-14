@@ -31,6 +31,7 @@ All configuration is read from environment / a local .env file. See .env.example
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -94,14 +95,22 @@ POLL_INTERVAL = int(env("POLL_INTERVAL", "60"))       # seconds between checks
 POLL_JITTER = int(env("POLL_JITTER", "15"))           # +/- random seconds
 DRY_RUN = env_bool("DRY_RUN", False)                  # detect but don't confirm
 
+# How often to re-check whether 42 redeployed (which can rotate the Next-Action
+# ids). 0 disables the periodic check (startup check still runs).
+BUILD_CHECK_MINUTES = int(env("BUILD_CHECK_MINUTES", "30"))
+
 # curl_cffi browser impersonation target (TLS/JA3 + default headers).
 IMPERSONATE = env("IMPERSONATE", "chrome")
 HTTP_TIMEOUT = int(env("HTTP_TIMEOUT", "30"))
 
-# Next.js Server Action ids. These are stable per site deployment but CHANGE
-# when 42 rebuilds the app; if booking starts failing, re-capture them from the
-# browser DevTools (Network -> the POST to /<locale>/paths -> "Next-Action"
-# request header) and update .env.
+# Next.js Server Action ids. The hashed ids rotate whenever 42 rebuilds the app,
+# but the underlying source function NAMES are stable — so by default we
+# auto-discover the current id from the /paths route chunk at booking time
+# (see discover_action_ids). The *_ID values below are only fallbacks used if
+# auto-discovery fails; set AUTO_DISCOVER_ACTIONS=0 to always use them verbatim.
+AUTO_DISCOVER_ACTIONS = env_bool("AUTO_DISCOVER_ACTIONS", True)
+BOOK_ACTION_NAME = env("BOOK_ACTION_NAME", "registerToMeeting")
+CANCEL_ACTION_NAME = env("CANCEL_ACTION_NAME", "delistMeeting")
 BOOK_ACTION_ID = env("BOOK_ACTION_ID", "40d11247e4160267d637cc7e938b72b96033964518")
 CANCEL_ACTION_ID = env("CANCEL_ACTION_ID", "40dfa9b6351b1482ff9ef246580415230e45575a08")
 NEXT_STATE_TREE = env(
@@ -121,6 +130,7 @@ STATE_DIR = HERE / "state"
 STATE_DIR.mkdir(exist_ok=True)
 BOOKED_SENTINEL = STATE_DIR / "BOOKED"
 COOKIES_FILE = STATE_DIR / "cookies.json"
+BUILD_SIG_FILE = STATE_DIR / "build_sig.txt"
 
 PATHS_URL = f"{BASE_URL}/{LOCALE}/paths"
 PATH_URL = f"{BASE_URL}/{LOCALE}/paths?pathId={PATH_ID}"
@@ -316,6 +326,91 @@ def fetch_meetings(s: cffi.Session) -> tuple[int, list[dict], str]:
 
 
 # --------------------------------------------------------------------------- #
+# Deployment-change detection (Next-Action ids rotate on redeploy)
+# --------------------------------------------------------------------------- #
+
+def build_signature(s: cffi.Session) -> str | None:
+    """A fingerprint of the site's current build: a hash of the set of
+    /_next/static/chunk filenames the paths page references. Every 42 redeploy
+    re-hashes those filenames, so a changed signature means the app was rebuilt
+    and the hard-coded Next-Action booking id may no longer be valid."""
+    try:
+        r = s.get(PATHS_URL, allow_redirects=True)
+    except Exception:
+        return None
+    chunks = sorted(set(re.findall(
+        r"/_next/static/chunks/[A-Za-z0-9_\-./]+?\.js", r.text
+    )))
+    if not chunks:
+        return None
+    return hashlib.sha1("\n".join(chunks).encode()).hexdigest()[:12]
+
+
+def check_build(s: cffi.Session) -> None:
+    """Compare the current build signature to the last seen one; note changes."""
+    sig = build_signature(s)
+    if not sig:
+        return
+    prev = BUILD_SIG_FILE.read_text(encoding="utf-8").strip() if BUILD_SIG_FILE.exists() else ""
+    if prev and sig != prev:
+        if AUTO_DISCOVER_ACTIONS:
+            log(f"apply.42.tech was redeployed (build {prev} → {sig}); "
+                f"booking action ids will be auto-rediscovered at booking time.")
+        else:
+            notify(
+                f"⚠️ apply.42.tech was redeployed (build {prev} → {sig}). The "
+                f"Next-Action booking id may have rotated — verify BOOK_ACTION_ID "
+                f"in .env by re-capturing it before the next slot opens."
+            )
+    if sig != prev:
+        try:
+            BUILD_SIG_FILE.write_text(sig, encoding="utf-8")
+        except Exception:
+            pass
+
+
+def discover_action_ids(s: cffi.Session) -> dict[str, str]:
+    """Map server-action source-name -> current hashed id, read straight from the
+    /paths route chunk. Function names (registerToMeeting, delistMeeting, …) are
+    stable across 42 redeploys; only the ids rotate — so this self-heals."""
+    try:
+        page = s.get(PATHS_URL, allow_redirects=True).text.replace("\\/", "/")
+    except Exception as exc:
+        log(f"action discovery: page fetch failed: {exc}")
+        return {}
+    m = re.search(r"/_next/static/chunks/app/\S*?paths/page-[0-9a-f]+\.js", page)
+    if not m:
+        log("action discovery: could not locate the paths page chunk.")
+        return {}
+    try:
+        code = s.get(BASE_URL + m.group(0)).text
+    except Exception as exc:
+        log(f"action discovery: chunk fetch failed: {exc}")
+        return {}
+    ids: dict[str, str] = {}
+    for mm in re.finditer(
+        r'createServerReference\)?\("([0-9a-f]{40,44})",[^,]*,[^,]*,[^,]*,"([^"]+)"',
+        code,
+    ):
+        ids[mm.group(2)] = mm.group(1)
+    return ids
+
+
+def resolve_action_id(s: cffi.Session, name: str, fallback_id: str) -> str:
+    """Current id for a named server action, auto-discovered when enabled."""
+    if not AUTO_DISCOVER_ACTIONS:
+        return fallback_id
+    got = discover_action_ids(s).get(name)
+    if got:
+        if got != fallback_id:
+            log(f"auto-discovered action '{name}' = {got} "
+                f"(differs from fallback {fallback_id})")
+        return got
+    log(f"action discovery failed for '{name}'; using fallback id {fallback_id}")
+    return fallback_id
+
+
+# --------------------------------------------------------------------------- #
 # Booking (Next.js Server Action)
 # --------------------------------------------------------------------------- #
 
@@ -336,14 +431,16 @@ def attempt_booking(s: cffi.Session, meeting: dict) -> bool:
     mid = meeting.get("id")
     log(f"booking meeting {fmt_meeting(meeting)}")
 
+    action_id = resolve_action_id(s, BOOK_ACTION_NAME, BOOK_ACTION_ID)
+
     if DRY_RUN:
-        notify(f"[DRY_RUN] Would POST book action for {fmt_meeting(meeting)}. "
-               f"Nothing booked.")
+        notify(f"[DRY_RUN] Would POST book action ({BOOK_ACTION_NAME}={action_id}) "
+               f"for {fmt_meeting(meeting)}. Nothing booked.")
         return False
 
     try:
         r = _server_action(
-            s, BOOK_ACTION_ID, [{"pathId": PATH_ID, "meetingId": mid}]
+            s, action_id, [{"pathId": PATH_ID, "meetingId": mid}]
         )
     except Exception as exc:
         notify(f"booking request errored for {fmt_meeting(meeting)}: {exc}")
@@ -352,9 +449,9 @@ def attempt_booking(s: cffi.Session, meeting: dict) -> bool:
     body = r.text or ""
     if r.status_code != 200:
         _dump_debug(body, "book-http-error")
-        notify(f"Booking returned HTTP {r.status_code} for {fmt_meeting(meeting)}. "
-               f"The Next-Action id may be stale — re-capture BOOK_ACTION_ID. "
-               f"BOOK IT MANUALLY.")
+        notify(f"Booking returned HTTP {r.status_code} for {fmt_meeting(meeting)} "
+               f"(action {BOOK_ACTION_NAME}={action_id}). Auto-discovery may have "
+               f"missed a renamed action — BOOK IT MANUALLY and check the logs.")
         return False
 
     # The RSC stream sometimes carries a server error. Sanity-check by re-reading
@@ -409,9 +506,18 @@ def mode_run() -> int:
         notify("Could not establish a login session. Check EMAIL/PASSWORD in .env.")
         return 2
 
+    check_build(s)                       # baseline / alert if it changed while down
+    last_build_check = time.monotonic()
+
     consecutive_errors = 0
     while True:
         try:
+            if BUILD_CHECK_MINUTES > 0 and (
+                time.monotonic() - last_build_check >= BUILD_CHECK_MINUTES * 60
+            ):
+                check_build(s)
+                last_build_check = time.monotonic()
+
             status, meetings, _ = fetch_meetings(s)
             if status != 200:
                 log(f"API status={status}; re-authenticating")
@@ -480,11 +586,32 @@ def mode_book_test() -> int:
     return 0
 
 
+def mode_discover() -> int:
+    """Diagnostic: print the current build signature + all discovered server
+    action ids (name -> id), highlighting the booking/cancel ones we use."""
+    s = _bootstrap_session()
+    if s is None:
+        log("not logged in.")
+        return 2
+    sig = build_signature(s)
+    ids = discover_action_ids(s)
+    book = ids.get(BOOK_ACTION_NAME)
+    cancel = ids.get(CANCEL_ACTION_NAME)
+    print(json.dumps({
+        "build_signature": sig,
+        "book": {"name": BOOK_ACTION_NAME, "id": book, "fallback": BOOK_ACTION_ID,
+                 "matches_fallback": book == BOOK_ACTION_ID},
+        "cancel": {"name": CANCEL_ACTION_NAME, "id": cancel, "fallback": CANCEL_ACTION_ID},
+        "all_actions": ids,
+    }, indent=2))
+    return 0 if book else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="42 apply online-meeting watcher (HTTP)")
     parser.add_argument(
         "mode", nargs="?", default="run",
-        choices=["run", "login", "check", "book-test"],
+        choices=["run", "login", "check", "book-test", "discover"],
     )
     args = parser.parse_args()
     return {
@@ -492,6 +619,7 @@ def main() -> int:
         "login": mode_login,
         "check": mode_check,
         "book-test": mode_book_test,
+        "discover": mode_discover,
     }[args.mode]()
 
 
