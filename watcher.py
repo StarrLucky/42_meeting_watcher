@@ -246,6 +246,20 @@ def do_login(s: cffi.Session) -> bool:
         return False
 
     log("logging in (Keycloak) ...")
+    # Start from a clean cookie state. Stale Keycloak SSO / next-auth cookies
+    # from a previous (expired) session make apply.42.tech and Keycloak bounce
+    # redirects at each other until curl gives up ("Maximum redirects followed").
+    try:
+        s.cookies.clear()
+    except Exception:
+        pass
+    try:
+        COOKIES_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
     try:
         r = s.get(PATHS_URL, allow_redirects=True)
     except Exception as exc:
